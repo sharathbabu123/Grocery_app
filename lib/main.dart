@@ -1,7 +1,7 @@
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart'; // WriteBuffer
 import 'package:flutter/material.dart';
 import 'package:google_mlkit_object_detection/google_mlkit_object_detection.dart';
 
@@ -62,7 +62,9 @@ class _HomePageState extends State<HomePage> {
     );
     await _controller!.initialize();
     _controller!.startImageStream(_processCameraImage);
-    setState(() {});
+    if (mounted) {
+      setState(() {});
+    }
   }
 
   void _processCameraImage(CameraImage image) async {
@@ -87,29 +89,35 @@ class _HomePageState extends State<HomePage> {
   }
 
   InputImage _inputImageFromCameraImage(CameraImage image) {
+    // 1. Flatten the planes of the image into a single Uint8List.
     final WriteBuffer allBytes = WriteBuffer();
     for (final Plane plane in image.planes) {
       allBytes.putUint8List(plane.bytes);
     }
-    final bytes = allBytes.done().buffer.asUint8List();
+    final Uint8List bytes = allBytes.done().buffer.asUint8List();
+
+    // 2. Get image metadata.
     final Size imageSize = Size(image.width.toDouble(), image.height.toDouble());
     final camera = _controller!.description;
-    final imageRotation = InputImageRotationValue.fromRawValue(camera.sensorOrientation) ?? InputImageRotation.rotation0deg;
-    final inputImageFormat = InputImageFormatValue.fromRawValue(image.format.raw) ?? InputImageFormat.nv21;
-    final planeData = image.planes.map(
-      (Plane plane) => InputImagePlaneMetadata(
-        bytesPerRow: plane.bytesPerRow,
-        height: plane.height,
-        width: plane.width,
-      ),
-    ).toList();
-    final inputImageData = InputImageData(
+    final InputImageRotation imageRotation =
+        InputImageRotationValue.fromRawValue(camera.sensorOrientation) ??
+            InputImageRotation.rotation0deg;
+
+    final InputImageFormat inputImageFormat =
+        InputImageFormatValue.fromRawValue(image.format.raw) ??
+            InputImageFormat.nv21;
+
+    // 3. Create the InputImageMetadata for the correct API version.
+    // This version of the library expects 'bytesPerRow' instead of 'planeData'.
+    final metadata = InputImageMetadata(
       size: imageSize,
-      imageRotation: imageRotation,
-      inputImageFormat: inputImageFormat,
-      planeData: planeData,
+      rotation: imageRotation,
+      format: inputImageFormat,
+      bytesPerRow: image.planes.first.bytesPerRow,
     );
-    return InputImage.fromBytes(bytes: bytes, inputImageData: inputImageData);
+
+    // 4. Create and return the InputImage.
+    return InputImage.fromBytes(bytes: bytes, metadata: metadata);
   }
 
   @override
