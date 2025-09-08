@@ -1,0 +1,82 @@
+{
+  "project_info": {
+    "project_number": "667875871369",
+    "project_id": "groc-b18e4",
+    "storage_bucket": "groc-b18e4.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:667875871369:android:fd4bf5d2e64a72bfdad458",
+        "android_client_info": {
+          "package_name": "com.example.grocery_inventory_app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "667875871369-94j72est65s0v24t95du3armt1pjomsk.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBC1dbPk1Q-wzQS3foCxgE6H8UlLL_dwII"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "667875871369-94j72est65s0v24t95du3armt1pjomsk.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "667875871369-vbpps4b2r6omsn7gv5plkhd8udhp63us.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.example.groceryInventoryApp"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:667875871369:android:a93997e7238d4187dad458",
+        "android_client_info": {
+          "package_name": "org.tensorflow.tflite_flutter.reinforcement_learning"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "667875871369-94j72est65s0v24t95du3armt1pjomsk.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBC1dbPk1Q-wzQS3foCxgE6H8UlLL_dwII"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "667875871369-94j72est65s0v24t95du3armt1pjomsk.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "667875871369-vbpps4b2r6omsn7gv5plkhd8udhp63us.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.example.groceryInventoryApp"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

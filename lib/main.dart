@@ -6,14 +6,27 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 
+import 'firebase_options.dart';
 import 'inventory_item.dart';
 import 'inventory_page.dart';
 import 'isolate_service.dart';
+import 'barcode_scan_page.dart';
+import 'qr_scan_page.dart';
+import 'login_page.dart';
+import 'get_started_page.dart';
+import 'inventory_repository.dart';
 
 // Main and MyApp are unchanged, but MyApp now points to our new HomePage
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
   runApp(const MyApp());
 }
 
@@ -24,7 +37,61 @@ class MyApp extends StatelessWidget {
     return MaterialApp(
       title: 'Grocery Inventory',
       theme: ThemeData(primarySwatch: Colors.green),
-      home: const HomePage(), // The app starts here now
+      home: const AuthGate(), // Show login if signed-out
+    );
+  }
+}
+
+//==============================================================================
+// AUTH GATE - Shows LoginPage when signed out, HomePage when signed in
+//==============================================================================
+
+class AuthGate extends StatelessWidget {
+  const AuthGate({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<User?>(
+      stream: FirebaseAuth.instance.authStateChanges(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Scaffold(
+            body: Center(child: CircularProgressIndicator()),
+          );
+        }
+        final user = snapshot.data;
+        if (user == null) {
+          return const _OnboardingDecider();
+        }
+        return const HomePage();
+      },
+    );
+  }
+}
+
+// Decides between GetStartedPage and LoginPage when signed-out
+class _OnboardingDecider extends StatelessWidget {
+  const _OnboardingDecider();
+
+  Future<bool> _seenOnboarding() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool('onboarding_seen') ?? false;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<bool>(
+      future: _seenOnboarding(),
+      builder: (context, snapshot) {
+        if (!snapshot.hasData) {
+          return const Scaffold(
+            body: Center(child: CircularProgressIndicator()),
+          );
+        }
+        final seen = snapshot.data ?? false;
+        if (!seen) return const GetStartedPage();
+        return const LoginPage();
+      },
     );
   }
 }
@@ -43,6 +110,13 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   // This is the master list of all items in the user's inventory.
   final List<InventoryItem> _masterInventoryList = [];
+  late final InventoryRepository _repo;
+
+  @override
+  void initState() {
+    super.initState();
+    _repo = InventoryRepository(FirebaseFirestore.instance);
+  }
 
   // This method handles the navigation to the scanning page and receives the data back.
   Future<void> _navigateToScanner() async {
@@ -54,8 +128,8 @@ class _HomePageState extends State<HomePage> {
 
     // If new items were returned and the widget is still mounted, update the state.
     if (newItems != null && mounted) {
+      // Update local (legacy) list for immediate UI feedback
       setState(() {
-        // Merge by name: increment quantity if item exists, else add.
         for (final newItem in newItems) {
           final idx = _masterInventoryList.indexWhere((i) => i.name == newItem.name);
           if (idx == -1) {
@@ -65,7 +139,150 @@ class _HomePageState extends State<HomePage> {
           }
         }
       });
+      final uid = FirebaseAuth.instance.currentUser?.uid;
+      if (uid != null) {
+        await _repo.upsertDetectedItems(uid, newItems);
+      }
     }
+  }
+
+  Future<void> _navigateToBarcode() async {
+    final List<InventoryItem>? newItems = await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (context) => const BarcodeScanPage()),
+    );
+    if (newItems != null && mounted) {
+      setState(() {
+        for (final newItem in newItems) {
+          final idx = _masterInventoryList.indexWhere((i) => i.name == newItem.name);
+          if (idx == -1) {
+            _masterInventoryList.add(newItem);
+          } else {
+            _masterInventoryList[idx].quantity += newItem.quantity;
+          }
+        }
+      });
+      final uid = FirebaseAuth.instance.currentUser?.uid;
+      if (uid != null) {
+        await _repo.upsertDetectedItems(uid, newItems);
+      }
+    }
+  }
+
+  Future<void> _navigateToQr() async {
+    final List<InventoryItem>? newItems = await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (context) => const QrScanPage()),
+    );
+    if (newItems != null && mounted) {
+      setState(() {
+        for (final newItem in newItems) {
+          final idx = _masterInventoryList.indexWhere((i) => i.name == newItem.name);
+          if (idx == -1) {
+            _masterInventoryList.add(newItem);
+          } else {
+            _masterInventoryList[idx].quantity += newItem.quantity;
+          }
+        }
+      });
+      final uid = FirebaseAuth.instance.currentUser?.uid;
+      if (uid != null) {
+        await _repo.upsertDetectedItems(uid, newItems);
+      }
+    }
+  }
+
+  Future<void> _showItemDialog({InventoryItem? item}) async {
+    final nameController = TextEditingController(text: item?.name ?? '');
+    final qtyController = TextEditingController(text: (item?.quantity ?? 1).toString());
+    ItemCategory category = item?.category ?? ItemCategory.other;
+    DateTime? expiry = item?.expiryDate;
+    await showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text(item == null ? 'Add Item' : 'Edit Item'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: nameController,
+                  decoration: const InputDecoration(labelText: 'Name'),
+                ),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: qtyController,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(labelText: 'Quantity'),
+                ),
+                const SizedBox(height: 8),
+                DropdownButtonFormField<ItemCategory>(
+                  value: category,
+                  decoration: const InputDecoration(labelText: 'Category'),
+                  items: ItemCategory.values
+                      .map((c) => DropdownMenuItem(value: c, child: Text(c.displayName)))
+                      .toList(),
+                  onChanged: (v) => category = v ?? category,
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        expiry == null
+                            ? 'No expiry'
+                            : 'Expires: ${DateFormat.yMMMd().format(expiry!)}',
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: () async {
+                        final picked = await showDatePicker(
+                          context: context,
+                          initialDate: expiry ?? DateTime.now(),
+                          firstDate: DateTime.now(),
+                          lastDate: DateTime(2101),
+                        );
+                        if (picked != null) {
+                          expiry = picked;
+                        }
+                      },
+                      child: const Text('Pick date'),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                final name = nameController.text.trim();
+                final qty = int.tryParse(qtyController.text.trim()) ?? 1;
+                if (name.isEmpty) return;
+                final uid = FirebaseAuth.instance.currentUser?.uid;
+                if (uid == null) return;
+                final newItem = InventoryItem(
+                  id: item?.id ?? '',
+                  name: name,
+                  quantity: qty,
+                  expiryDate: expiry,
+                  category: category,
+                );
+                await _repo.addOrUpdateItem(uid, newItem);
+                if (!mounted) return;
+                Navigator.pop(context);
+              },
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   @override
@@ -73,55 +290,127 @@ class _HomePageState extends State<HomePage> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('My Grocery Inventory'),
+        actions: [
+          IconButton(
+            tooltip: 'Add item',
+            icon: const Icon(Icons.add),
+            onPressed: () => _showItemDialog(),
+          ),
+          IconButton(
+            tooltip: 'Sign out',
+            icon: const Icon(Icons.logout),
+            onPressed: () async {
+              await FirebaseAuth.instance.signOut();
+            },
+          ),
+        ],
       ),
       // The FloatingActionButton is the primary way to start scanning.
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _navigateToScanner,
-        label: const Text('Scan New Items'),
-        icon: const Icon(Icons.camera_alt),
+      floatingActionButton: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          FloatingActionButton.extended(
+            heroTag: 'scan_items',
+            onPressed: _navigateToScanner,
+            label: const Text('Scan Items'),
+            icon: const Icon(Icons.camera_alt),
+          ),
+          const SizedBox(width: 12),
+          FloatingActionButton.extended(
+            heroTag: 'scan_barcode',
+            onPressed: _navigateToBarcode,
+            label: const Text('Scan Barcode'),
+            icon: const Icon(Icons.qr_code),
+          ),
+        ],
       ),
       floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
-      body: _masterInventoryList.isEmpty
-          // Show a helpful message if the inventory is empty.
-          ? const Center(
-              child: Padding(
-                padding: EdgeInsets.all(24.0),
-                child: Text(
-                  'Your inventory is empty.\nTap the "Scan New Items" button to get started!',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 18, color: Colors.grey),
-                ),
-              ),
-            )
-          // Display the list of inventory items.
-          : ListView.builder(
-              padding: const EdgeInsets.only(bottom: 80), // Space for the FAB
-              itemCount: _masterInventoryList.length,
-              itemBuilder: (context, index) {
-                final item = _masterInventoryList[index];
-                return Card(
-                  margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  elevation: 4,
-                  child: ListTile(
-                    leading: CircleAvatar(
-                      backgroundColor: Theme.of(context).primaryColorLight,
-                      child: Text(item.name[0].toUpperCase()), // First letter of the item name
-                    ),
-                    title: Text(item.name, style: const TextStyle(fontWeight: FontWeight.bold)),
-                    subtitle: Text('Category: ${item.category.displayName}'),
-                    trailing: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      crossAxisAlignment: CrossAxisAlignment.end,
-                      children: [
-                        Text('Qty: ${item.quantity}'),
-                        if (item.expiryDate != null)
-                          Text(DateFormat.yMMMd().format(item.expiryDate!)),
-                      ],
+      body: Builder(
+        builder: (context) {
+          final uid = FirebaseAuth.instance.currentUser?.uid;
+          if (uid == null) {
+            return const Center(child: Text('Not signed in'));
+          }
+          return StreamBuilder<List<InventoryItem>>(
+            stream: _repo.streamInventory(uid),
+            builder: (context, snapshot) {
+              if (snapshot.connectionState == ConnectionState.waiting) {
+                return const Center(child: CircularProgressIndicator());
+              }
+              final items = snapshot.data ?? const <InventoryItem>[];
+              if (items.isEmpty) {
+                return const Center(
+                  child: Padding(
+                    padding: EdgeInsets.all(24.0),
+                    child: Text(
+                      'Your inventory is empty.\nTap Scan or the + button to add items.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontSize: 18, color: Colors.grey),
                     ),
                   ),
                 );
-              },
-            ),
+              }
+              return ListView.builder(
+                padding: const EdgeInsets.only(bottom: 80),
+                itemCount: items.length,
+                itemBuilder: (context, index) {
+                  final item = items[index];
+                  return Card(
+                    margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    elevation: 4,
+                    child: ListTile(
+                      onTap: () => _showItemDialog(item: item),
+                      leading: CircleAvatar(
+                        backgroundColor: Theme.of(context).primaryColorLight,
+                        child: Text(item.name[0].toUpperCase()),
+                      ),
+                      title: Text(item.name, style: const TextStyle(fontWeight: FontWeight.bold)),
+                      subtitle: Text('Category: ${item.category.displayName}' +
+                          (item.expiryDate != null
+                              ? '\nExpires: ${DateFormat.yMMMd().format(item.expiryDate!)}'
+                              : '')),
+                      isThreeLine: item.expiryDate != null,
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            icon: const Icon(Icons.remove_circle_outline),
+                            onPressed: () async {
+                              final newQty = item.quantity - 1;
+                              final uid = FirebaseAuth.instance.currentUser!.uid;
+                              if (newQty <= 0) {
+                                await _repo.deleteItem(uid, item.id);
+                              } else {
+                                await _repo.setQuantity(uid, item.id, newQty);
+                              }
+                            },
+                          ),
+                          Text(' ${item.quantity} '),
+                          IconButton(
+                            icon: const Icon(Icons.add_circle_outline),
+                            onPressed: () async {
+                              final uid = FirebaseAuth.instance.currentUser!.uid;
+                              await _repo.incrementQuantity(uid, item.id, 1);
+                            },
+                          ),
+                          IconButton(
+                            tooltip: 'Delete',
+                            icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
+                            onPressed: () async {
+                              final uid = FirebaseAuth.instance.currentUser!.uid;
+                              await _repo.deleteItem(uid, item.id);
+                            },
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              );
+            },
+          );
+        },
+      ),
     );
   }
 }
