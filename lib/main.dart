@@ -1,14 +1,17 @@
 import 'dart:async';
-import 'dart:io' show Platform;
-import 'dart:typed_data';
+import 'dart:isolate';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:google_mlkit_image_labeling/google_mlkit_image_labeling.dart';
-import 'package:google_mlkit_object_detection/google_mlkit_object_detection.dart';
+import 'package:intl/intl.dart';
+import 'package:tflite_flutter/tflite_flutter.dart';
 
-import 'results_page.dart';
+import 'inventory_item.dart';
+import 'inventory_page.dart';
+import 'isolate_service.dart';
 
+// Main and MyApp are unchanged, but MyApp now points to our new HomePage
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const MyApp());
@@ -21,48 +24,148 @@ class MyApp extends StatelessWidget {
     return MaterialApp(
       title: 'Grocery Inventory',
       theme: ThemeData(primarySwatch: Colors.green),
-      home: const HomePage(),
+      home: const HomePage(), // The app starts here now
     );
   }
 }
 
+//==============================================================================
+// NEW HOME PAGE - Displays the final inventory
+//==============================================================================
+
 class HomePage extends StatefulWidget {
   const HomePage({Key? key}) : super(key: key);
+
   @override
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
-  // --- Tunables ---
-  static const double _confidenceThreshold = 0.7;              // << threshold = 0.5
-  static const Duration _minProcessInterval = Duration(milliseconds: 200); // ~5 fps
+class _HomePageState extends State<HomePage> {
+  // This is the master list of all items in the user's inventory.
+  final List<InventoryItem> _masterInventoryList = [];
+
+  // This method handles the navigation to the scanning page and receives the data back.
+  Future<void> _navigateToScanner() async {
+    // We expect a List<InventoryItem> to be returned from the scanning flow.
+    final List<InventoryItem>? newItems = await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (context) => const CameraPage()),
+    );
+
+    // If new items were returned and the widget is still mounted, update the state.
+    if (newItems != null && mounted) {
+      setState(() {
+        // Merge by name: increment quantity if item exists, else add.
+        for (final newItem in newItems) {
+          final idx = _masterInventoryList.indexWhere((i) => i.name == newItem.name);
+          if (idx == -1) {
+            _masterInventoryList.add(newItem);
+          } else {
+            _masterInventoryList[idx].quantity += newItem.quantity;
+          }
+        }
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('My Grocery Inventory'),
+      ),
+      // The FloatingActionButton is the primary way to start scanning.
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _navigateToScanner,
+        label: const Text('Scan New Items'),
+        icon: const Icon(Icons.camera_alt),
+      ),
+      floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
+      body: _masterInventoryList.isEmpty
+          // Show a helpful message if the inventory is empty.
+          ? const Center(
+              child: Padding(
+                padding: EdgeInsets.all(24.0),
+                child: Text(
+                  'Your inventory is empty.\nTap the "Scan New Items" button to get started!',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 18, color: Colors.grey),
+                ),
+              ),
+            )
+          // Display the list of inventory items.
+          : ListView.builder(
+              padding: const EdgeInsets.only(bottom: 80), // Space for the FAB
+              itemCount: _masterInventoryList.length,
+              itemBuilder: (context, index) {
+                final item = _masterInventoryList[index];
+                return Card(
+                  margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  elevation: 4,
+                  child: ListTile(
+                    leading: CircleAvatar(
+                      backgroundColor: Theme.of(context).primaryColorLight,
+                      child: Text(item.name[0].toUpperCase()), // First letter of the item name
+                    ),
+                    title: Text(item.name, style: const TextStyle(fontWeight: FontWeight.bold)),
+                    subtitle: Text('Category: ${item.category.displayName}'),
+                    trailing: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: [
+                        Text('Qty: ${item.quantity}'),
+                        if (item.expiryDate != null)
+                          Text(DateFormat.yMMMd().format(item.expiryDate!)),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+    );
+  }
+}
+
+
+//==============================================================================
+// RENAMED CAMERA PAGE - The screen with the live camera feed
+//==============================================================================
+
+class CameraPage extends StatefulWidget {
+  const CameraPage({Key? key}) : super(key: key);
+  @override
+  State<CameraPage> createState() => _CameraPageState();
+}
+
+class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
+  // All state variables and methods from your previous main.dart are moved here.
+  static const Duration _minProcessInterval = Duration(milliseconds: 700);
 
   CameraController? _controller;
-  late final ObjectDetector _objectDetector;
-  late final ImageLabeler _labeler;
-
+  Interpreter? _interpreter;
+  late List<String> _labels;
   bool _isProcessing = false;
-  bool _streaming = false;
   DateTime _lastProcessed = DateTime.fromMillisecondsSinceEpoch(0);
-  int _frameCount = 0;
-
-  // Per-frame live sets (not persisted)
-  final Set<String> _frameCoarse = <String>{};    // "Food", "Home goods", etc.
-  final Set<String> _frameSpecific = <String>{};  // "banana", "bottle", etc.
-
-  // --- PERSISTED session list (what you asked for) ---
-  final Set<String> _capturedItems = <String>{};
-
-  // For small on-screen console + de-spam logs
-  final Set<String> _lastFrameCoarse = <String>{};
-  final Set<String> _lastFrameSpecific = <String>{};
+  Isolate? _isolate;
+  ReceivePort? _mainReceivePort;
+  SendPort? _isolateSendPort;
+  final Set<String> _frameSpecific = <String>{};
   final List<String> _liveLog = <String>[];
+  bool _isCapturing = false;
+  final List<Uint8List> _capturedImages = [];
+  final Set<String> _inventoryItems = <String>{};
+  
+  // --- REMOVED: The _groceryWhitelist is no longer needed. ---
+
   void _log(String msg) {
     if (!mounted) return;
-    final ts = TimeOfDay.now().format(context);
+    final now = DateTime.now();
+    final ts = '${now.hour.toString().padLeft(2, '0')}:'
+        '${now.minute.toString().padLeft(2, '0')}:'
+        '${now.second.toString().padLeft(2, '0')}';
     debugPrint('[DETECT $ts] $msg');
     setState(() {
-      _liveLog.add('$ts  $msg');
+      _liveLog.add('$ts $msg');
       if (_liveLog.length > 60) _liveLog.removeAt(0);
     });
   }
@@ -71,349 +174,247 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _initialize();
+  }
 
-    _objectDetector = ObjectDetector(
-      options: ObjectDetectorOptions(
-        mode: DetectionMode.stream,
-        multipleObjects: true,
-        classifyObjects: true, // gives coarse categories
-      ),
-    );
-
-    _labeler = ImageLabeler(
-      options: ImageLabelerOptions(
-        confidenceThreshold: _confidenceThreshold, // apply 0.5 on labeler
-      ),
-    );
-
-    unawaited(_initializeCamera());
+  Future<void> _initialize() async {
+    _log('Initializing...');
+    await _startIsolate();
+    await _loadModelAndLabels();
+    await _initializeCamera();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _stopStream();
-    _controller?.dispose();
-    _objectDetector.close();
-    _labeler.close();
+    _teardown();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
     final controller = _controller;
-    if (controller == null || !controller.value.isInitialized) return;
-
+    if (controller == null) {
+      if (state == AppLifecycleState.resumed) {
+        _initialize();
+      }
+      return;
+    }
+    if (!controller.value.isInitialized) return;
     if (state == AppLifecycleState.inactive) {
-      _stopStream();
-      controller.dispose();
+      _teardown();
     } else if (state == AppLifecycleState.resumed) {
-      unawaited(_initializeCamera());
+      _initialize();
+    }
+  }
+
+  Future<void> _teardown() async {
+    _log('Tearing down...');
+    await _stopStream();
+    await _controller?.dispose();
+    _controller = null;
+    _isolate?.kill(priority: Isolate.immediate);
+    _isolate = null;
+    _isolateSendPort = null;
+    _mainReceivePort?.close();
+    _log('Teardown complete.');
+  }
+
+  Future<void> _startIsolate() async {
+    if (_isolate != null) return;
+    _mainReceivePort = ReceivePort();
+    _isolate =
+        await Isolate.spawn(isolateEntryPoint, _mainReceivePort!.sendPort);
+    _mainReceivePort!.listen((message) {
+      if (_isolateSendPort == null && message is SendPort) {
+        _isolateSendPort = message;
+        _log('Isolate connection established.');
+      } else if (message is Set<String>) {
+        _handleIsolateResult(message);
+      }
+    });
+  }
+
+  // --- MODIFIED: This method now accepts all high-confidence detections ---
+  void _handleIsolateResult(Set<String> labelsFound) {
+    if (!mounted) {
+      _isProcessing = false;
+      return;
+    }
+    // Clean up the labels from the model (e.g., "tabby, tabby cat" -> "tabby")
+    // but do not filter them against a whitelist.
+    final cleanedLabels = labelsFound.map((label) {
+      return label.split(',').first;
+    }).toSet();
+
+    if (!setEquals(_frameSpecific, cleanedLabels)) {
+      setState(() {
+        _frameSpecific.clear();
+        _frameSpecific.addAll(cleanedLabels);
+      });
+    }
+
+    final newlyCapturedLabels = cleanedLabels.difference(_inventoryItems);
+    if (newlyCapturedLabels.isNotEmpty) {
+      setState(() {
+        _inventoryItems.addAll(newlyCapturedLabels);
+        for (final label in newlyCapturedLabels) {
+          _log('Added to inventory: $label');
+        }
+      });
+    } else if (_isCapturing) {
+      _log('Nothing new detected in captured image.');
+    }
+    _isProcessing = false;
+  }
+
+  Future<void> _loadModelAndLabels() async {
+    if (_interpreter != null) return;
+    try {
+      final rawLabels =
+          await DefaultAssetBundle.of(context).loadString('assets/labels.txt');
+      _labels = rawLabels
+          .split('\n')
+          .map((s) => s.trim())
+          .where((s) => s.isNotEmpty)
+          .toList();
+      final options = InterpreterOptions()..threads = 2;
+      _interpreter = await Interpreter.fromAsset(
+          'assets/models/grocery_model.tflite',
+          options: options);
+      _log('Model loaded. Labels count: ${_labels.length}');
+    } catch (e) {
+      _log('Error loading model: $e');
     }
   }
 
   Future<void> _initializeCamera() async {
+    if (_controller != null) return; // Prevent reinitialization
     try {
       final cameras = await availableCameras();
+      if (cameras.isEmpty) {
+        _log('No cameras found!');
+        return;
+      }
       final camera = cameras.firstWhere(
         (c) => c.lensDirection == CameraLensDirection.back,
         orElse: () => cameras.first,
       );
-
-      final controller = CameraController(
+      _controller = CameraController(
         camera,
-        ResolutionPreset.low, // lighter to avoid buffer starvation
+        ResolutionPreset.low, // CRITICAL FIX for performance
         enableAudio: false,
         imageFormatGroup: ImageFormatGroup.yuv420,
       );
-
-      _controller = controller;
-      await controller.initialize();
+      await _controller!.initialize();
       if (!mounted) return;
-
-      await _startStream();
+      await _controller!.startImageStream(_processCameraImage);
       setState(() {});
+      _log('Camera initialized and stream started.');
     } catch (e) {
-      debugPrint('Camera init error: $e');
-    }
-  }
-
-  Future<void> _startStream() async {
-    if (_streaming) return;
-    final controller = _controller;
-    if (controller == null || !controller.value.isInitialized) return;
-    try {
-      await controller.startImageStream(_processCameraImage);
-      _streaming = true;
-    } catch (e) {
-      debugPrint('startImageStream error: $e');
+      _log('Camera init error: $e');
     }
   }
 
   Future<void> _stopStream() async {
-    if (!_streaming) return;
-    try {
-      await _controller?.stopImageStream();
-    } catch (_) {
-      // ignore
-    } finally {
-      _streaming = false;
+    if (_controller != null && _controller!.value.isStreamingImages) {
+      try {
+        await _controller!.stopImageStream();
+      } catch (e) {
+        _log('Error stopping stream: $e');
+      }
     }
   }
+  
+  void _processCameraImage(CameraImage image) {
+      if (_isolateSendPort == null || _interpreter == null || _isProcessing || !mounted) return;
+      final now = DateTime.now();
+      if (now.difference(_lastProcessed) < _minProcessInterval) return;
+      _isProcessing = true;
+      _lastProcessed = now;
+      var cameraImageData = CameraImageData(
+          width: image.width,
+          height: image.height,
+          planesBytes: image.planes.map((p) => p.bytes).toList(),
+          planesBytesPerRow: image.planes.map((p) => p.bytesPerRow).toList(),
+          planesBytesPerPixel: image.planes.map((p) => p.bytesPerPixel).toList(),
+      );
+      final isolateData = IsolateData(cameraImageData, _interpreter!.address, _labels);
+      _isolateSendPort!.send(isolateData);
+  }
 
-  // ---- Frame analyzer (throttled) ----
-  void _processCameraImage(CameraImage image) async {
-    final now = DateTime.now();
-    if (now.difference(_lastProcessed) < _minProcessInterval) return;
-    if (_isProcessing) return;
-
-    _isProcessing = true;
-    _lastProcessed = now;
-    _frameCount++;
-
+  Future<void> _captureAndProcessImage() async {
+    if (_controller == null || !_controller!.value.isInitialized || _isCapturing) {
+      return;
+    }
     try {
-      final inputImage = _inputImageFromCameraImage(image);
+      setState(() => _isCapturing = true);
+      _log('Capturing image...');
+      await _stopStream();
+      
+      final XFile imageFile = await _controller!.takePicture();
+      final Uint8List imageBytes = await imageFile.readAsBytes();
 
-      // 1) Object Detection (coarse categories) with threshold on label confidence
-      _frameCoarse.clear();
-      final objects = await _objectDetector.processImage(inputImage);
-      for (final o in objects) {
-        for (final l in o.labels) {
-          final conf = l.confidence ?? 1.0;
-          if (conf >= _confidenceThreshold) {
-            _frameCoarse.add(l.text);
-          }
-        }
-      }
-      // Log newly-seen coarse labels this frame
-      for (final label in _frameCoarse.difference(_lastFrameCoarse)) {
-        _log('Coarse: $label');
-      }
+      setState(() => _capturedImages.add(imageBytes));
 
-      // 2) Specific labels (whole-frame labeler) every 3rd frame
-      if (_frameCount % 3 == 0) {
-        _frameSpecific.clear();
-        final labels = await _labeler.processImage(inputImage);
-        for (final lab in labels) {
-          if (lab.confidence >= _confidenceThreshold) {
-            _frameSpecific.add(lab.label);
-          }
-        }
-        for (final s in _frameSpecific.difference(_lastFrameSpecific)) {
-          _log('Specific: $s');
-        }
-      }
-
-      // 3) Persist into session list (does not clear on camera movement)
-      // Prefer specific labels; if none, fall back to coarse.
-      final toCapture = _frameSpecific.isNotEmpty ? _frameSpecific : _frameCoarse;
-      final newlyCaptured = toCapture.difference(_capturedItems);
-      if (newlyCaptured.isNotEmpty) {
-        _capturedItems.addAll(newlyCaptured);
-        for (final item in newlyCaptured) {
-          _log('Captured new item: $item'); // sticky in session
-        }
-      }
-
-      if (!mounted) return;
-      setState(() {
-        // no-op; we already updated sets; this rebuilds chips & button state
-      });
-
-      // update last-frame trackers
-      _lastFrameCoarse
-        ..clear()
-        ..addAll(_frameCoarse);
-      _lastFrameSpecific
-        ..clear()
-        ..addAll(_frameSpecific);
+      final staticImageData = StaticImageData(imageBytes);
+      final isolateData = IsolateData(staticImageData, _interpreter!.address, _labels);
+      
+      _log('Sending captured image for detection...');
+      _isProcessing = true;
+      _isolateSendPort?.send(isolateData);
     } catch (e) {
-      debugPrint('Error processing image: $e');
-    } finally {
+      _log('Error capturing image: $e');
       _isProcessing = false;
-    }
-  }
-
-  // ---- Image conversion helpers ----
-  Uint8List _yuv420ToNV21(CameraImage image) {
-    final int width = image.width;
-    final int height = image.height;
-
-    final int ySize = width * height;
-    final int uvSize = (width * height) >> 1;
-
-    final Uint8List nv21 = Uint8List(ySize + uvSize);
-
-    // Y plane
-    nv21.setRange(0, ySize, image.planes[0].bytes);
-
-    // Interleave V and U (NV21)
-    final Plane uPlane = image.planes[1];
-    final Plane vPlane = image.planes[2];
-    final int uvRowStride = uPlane.bytesPerRow;
-    final int uvPixelStride = uPlane.bytesPerPixel ?? 1;
-
-    int pos = ySize;
-    for (int row = 0; row < height ~/ 2; row++) {
-      for (int col = 0; col < width ~/ 2; col++) {
-        final int uvIndex = row * uvRowStride + col * uvPixelStride;
-        nv21[pos++] = vPlane.bytes[uvIndex]; // V
-        nv21[pos++] = uPlane.bytes[uvIndex]; // U
+    } finally {
+      await Future.delayed(const Duration(milliseconds: 500));
+      if (mounted) {
+        await _controller?.startImageStream(_processCameraImage);
+        setState(() => _isCapturing = false);
       }
     }
-    return nv21;
   }
 
-  InputImage _inputImageFromCameraImage(CameraImage image) {
-    final rotation = InputImageRotationValue.fromRawValue(
-            _controller!.description.sensorOrientation) ??
-        InputImageRotation.rotation0deg;
-
-    if (Platform.isAndroid) {
-      final bytes = _yuv420ToNV21(image);
-      return InputImage.fromBytes(
-        bytes: bytes,
-        metadata: InputImageMetadata(
-          size: Size(image.width.toDouble(), image.height.toDouble()),
-          rotation: rotation,
-          format: InputImageFormat.nv21,
-          bytesPerRow: image.planes[0].bytesPerRow,
-        ),
-      );
-    } else {
-      // iOS BGRA8888
-      return InputImage.fromBytes(
-        bytes: image.planes[0].bytes,
-        metadata: InputImageMetadata(
-          size: Size(image.width.toDouble(), image.height.toDouble()),
-          rotation: rotation,
-          format: InputImageFormat.bgra8888,
-          bytesPerRow: image.planes[0].bytesPerRow,
-        ),
-      );
-    }
-  }
-
-  // Navigate to results with the PERSISTED session list
   Future<void> _submitInventory() async {
-    await _stopStream();
     if (!mounted) return;
-
-    await Navigator.push(
+    await _stopStream();
+    final List<InventoryItem>? confirmedItems = await Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (context) => ResultsPage(
-          detectedItems: _capturedItems.toList(),
+        builder: (context) => InventoryPage(
+          detectedItems: _inventoryItems.toList(),
         ),
       ),
     );
-
-    if (!mounted) return;
-    await _startStream();
+    if (confirmedItems != null) {
+      Navigator.of(context).pop(confirmedItems);
+    } else {
+      if (mounted) {
+        await _controller?.startImageStream(_processCameraImage);
+      }
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    final canSubmit = _capturedItems.isNotEmpty; // stays true once something captured
+    final canSubmit = _inventoryItems.isNotEmpty;
     return Scaffold(
-      appBar: AppBar(title: const Text('Pantry Scanner')),
+      appBar: AppBar(title: const Text('Scan Items')),
+      floatingActionButton: FloatingActionButton(onPressed: _captureAndProcessImage, child: const Icon(Icons.camera_alt)),
+      floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
       body: Stack(
         children: [
-          // Camera preview
-          Positioned.fill(
-            child: _controller == null || !_controller!.value.isInitialized
-                ? const Center(child: CircularProgressIndicator())
-                : CameraPreview(_controller!),
-          ),
-
-          // Live console overlay
-          Positioned(
-            left: 12,
-            right: 12,
-            top: 12,
-            child: IgnorePointer(
-              child: Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: Colors.black.withOpacity(0.45),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: SizedBox(
-                  height: 96,
-                  child: ListView.builder(
-                    reverse: true,
-                    itemCount: _liveLog.length,
-                    itemBuilder: (_, i) => Text(
-                      _liveLog[_liveLog.length - 1 - i],
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontFamily: 'monospace',
-                        fontSize: 12,
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ),
-
-          // Row A: Live (this-frame) specific labels (yellow)
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: 140,
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              child: Row(
-                children: _frameSpecific.map((item) {
-                  return Padding(
-                    padding: const EdgeInsets.only(right: 8),
-                    child: Chip(
-                      label: Text(item),
-                      backgroundColor: Colors.yellow.withOpacity(0.95),
-                      side: const BorderSide(color: Colors.orange),
-                    ),
-                  );
-                }).toList(),
-              ),
-            ),
-          ),
-
-          // Row B: PERSISTED "Captured so far" items (blue)
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: 90,
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              child: Row(
-                children: _capturedItems.map((item) {
-                  return Padding(
-                    padding: const EdgeInsets.only(right: 8),
-                    child: Chip(
-                      label: Text(item),
-                      backgroundColor: Colors.lightBlueAccent.withOpacity(0.95),
-                      side: const BorderSide(color: Colors.blue),
-                    ),
-                  );
-                }).toList(),
-              ),
-            ),
-          ),
-
-          // Submit button (stays enabled after first capture)
-          Positioned(
-            left: 16,
-            right: 16,
-            bottom: 16,
-            child: ElevatedButton(
-              style: ElevatedButton.styleFrom(minimumSize: const Size.fromHeight(50)),
-              onPressed: canSubmit ? _submitInventory : null,
-              child: const Text('Submit Inventory', style: TextStyle(fontSize: 18)),
-            ),
-          ),
+          if (_controller != null && _controller!.value.isInitialized)
+            Positioned.fill(child: CameraPreview(_controller!))
+          else
+            const Center(child: CircularProgressIndicator(valueColor: AlwaysStoppedAnimation<Color>(Colors.green))),
+          Positioned(left: 12, top: 12, right: 12, child: IgnorePointer(child: Container(padding: const EdgeInsets.all(8), decoration: BoxDecoration(color: Colors.black.withOpacity(0.45), borderRadius: BorderRadius.circular(8)), child: SizedBox(height: 96, child: ListView.builder(reverse: true, itemCount: _liveLog.length, itemBuilder: (_, i) => Text(_liveLog[_liveLog.length - 1 - i], style: const TextStyle(color: Colors.white, fontFamily: 'monospace', fontSize: 12))))))),
+          Positioned(left: 0, right: 0, bottom: 270, child: SingleChildScrollView(scrollDirection: Axis.horizontal, padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6), child: Row(children: _frameSpecific.map((item) => Padding(padding: const EdgeInsets.only(right: 8), child: Chip(label: Text(item), backgroundColor: Colors.yellow.withOpacity(0.95), side: const BorderSide(color: Colors.orange)))).toList()))),
+          Positioned(left: 0, right: 0, bottom: 180, child: Container(padding: const EdgeInsets.symmetric(vertical: 8), color: Colors.black.withOpacity(0.2), child: SingleChildScrollView(scrollDirection: Axis.horizontal, padding: const EdgeInsets.symmetric(horizontal: 12), child: Row(children: _inventoryItems.map((item) => Padding(padding: const EdgeInsets.only(right: 8), child: Chip(label: Text(item), backgroundColor: Colors.lightBlueAccent.withOpacity(0.95), side: const BorderSide(color: Colors.blue)))).toList())))),
+          Positioned(left: 0, right: 0, bottom: 90, child: Container(height: 80, color: Colors.black.withOpacity(0.2), child: ListView.builder(scrollDirection: Axis.horizontal, padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8), itemCount: _capturedImages.length, itemBuilder: (context, index) { final imageBytes = _capturedImages[index]; return Padding(padding: const EdgeInsets.only(right: 10.0), child: Container(width: 64, height: 64, decoration: BoxDecoration(borderRadius: BorderRadius.circular(8), border: Border.all(color: Colors.white, width: 2)), child: ClipRRect(borderRadius: BorderRadius.circular(6), child: Image.memory(imageBytes, fit: BoxFit.cover)))); }))),
+          Positioned(left: 16, right: 16, bottom: 16, child: ElevatedButton(style: ElevatedButton.styleFrom(minimumSize: const Size.fromHeight(50)), onPressed: canSubmit ? _submitInventory : null, child: const Text('Confirm Detections', style: TextStyle(fontSize: 18)))),
+          if (_isCapturing) Positioned.fill(child: Container(color: Colors.black.withOpacity(0.5), child: const Center(child: CircularProgressIndicator(valueColor: AlwaysStoppedAnimation<Color>(Colors.white))))),
         ],
       ),
     );
